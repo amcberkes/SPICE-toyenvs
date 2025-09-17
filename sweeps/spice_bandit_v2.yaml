@@ -1,0 +1,60 @@
+program: spice/train_spice.py
+method: bayes
+
+metric:
+  name: sanity/micro_regret_vs_dpt
+  goal: minimize
+
+parameters:
+  # Fixed dataset / env
+  env:        { value: bandit }
+  envs:       { value: 100000 }
+  H:          { value: 500 }
+  dim:        { value: 5 }
+  var:        { value: 0.3 }
+  cov:        { value: 0.0 }
+  hists:      { value: 1 }
+  samples:    { value: 1 }
+  wandb:      { value: true }
+
+  # Model backbone
+  layer:      { values: [4] }
+  head:       { values: [1] }
+  embd:       { values: [64] }
+  dropout:    { values: [0.0] }
+
+  # Optim
+  lr:         { values: [0.0001] }       # numeric, not a quoted string
+  num_epochs: { value: 300 }
+  seed:       { values: [0, 1, 2] }
+  shuffle:    { values: [true] }
+
+  # SPICE hyper-params (bandit-friendly)
+  spice_heads:   { values: [5, 7] }
+  spice_prior:   { values: [0.005, 0.01, 0.02, 0.05] }
+  alphaA:        { values: [0.5] }
+  lambda_sigma:  { values: [0.0] }       # TS via heads; keep off
+  c_sigma:       { values: [3.0] }
+  lambda_q:      { values: [2.0] }
+  lambda_var:    { values: [0.0, 0.02] } # optional collapse regularizer
+
+  # IS stabilizers
+  is_laplace:    { values: [1.0] }
+  is_cap:        { values: [10.0, 15.0, 20.0] }
+
+  # Save dir
+  models_dir:    { value: models_new }
+
+  # DPT baseline path for micro-probe
+  dpt_ckpt:
+    value: /home/mila/a/anaisb/scratch/SPICE-toyenvs/models_notperhead/bandit_shufTrue_lr0.0001_do0.0_embd64_layer6_head1_envs100000_hists1_samples1_var0.3_cov0.0_H500_d5_seed0_epoch300.pt
+
+  # Make the objective visible early
+  micro_probe_every: { value: 10 }
+  micro_probe_H:     { value: 200 }
+  micro_probe_n_eval: { value: 16 }
+
+early_terminate:
+  type: hyperband
+  min_iter: 60
+  eta: 3

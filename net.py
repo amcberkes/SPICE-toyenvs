@@ -26,7 +26,7 @@ class Transformer(nn.Module):
             n_positions=4 * (1 + self.horizon),
             n_embd=self.n_embd,
             n_layer=self.n_layer,
-            n_head=1,
+            n_head=self.n_head,
             resid_pdrop=self.dropout,
             embd_pdrop=self.dropout,
             attn_pdrop=self.dropout,

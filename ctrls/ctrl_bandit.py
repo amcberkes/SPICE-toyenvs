@@ -31,9 +31,8 @@ class OptPolicy(Controller):
     def act(self, x):
         return self.env.opt_a
 
-
     def act_numpy_vec(self, x):
-        opt_as = [ env.opt_a for env in self.env ]
+        opt_as = [env.opt_a for env in self.env]
         return np.stack(opt_as, axis=0)
         # return np.tile(self.env.opt_a, (self.batch_size, 1))
 
@@ -55,7 +54,7 @@ class GreedyOptPolicy(Controller):
 
 
 class EmpMeanPolicy(Controller):
-    def __init__(self, env, online=False, batch_size = 1):
+    def __init__(self, env, online=False, batch_size=1):
         super().__init__()
         self.env = env
         self.online = online
@@ -81,7 +80,7 @@ class EmpMeanPolicy(Controller):
         j = np.argmin(counts)
         if self.online and counts[j] == 0:
             i = j
-        
+
         a = np.zeros(self.env.dim)
         a[i] = 1.0
 
@@ -118,15 +117,19 @@ class EmpMeanPolicy(Controller):
         return self.a
 
 
-
 class ThompsonSamplingPolicy(Controller):
+    """
+    Gaussian-TS with known observation variance. This version clamps all uses of
+    (co)variance by a tiny epsilon so σ=0.0 is handled without NaNs.
+    """
     def __init__(self, env, std=.1, sample=False, prior_mean=.5, prior_var=1/12.0, warm_start=False, batch_size=1):
         super().__init__()
         self.env = env
-        self.variance = std**2
-        self.prior_mean = prior_mean
-        self.prior_variance = prior_var
+        self.variance = float(std) ** 2
+        self.prior_mean = float(prior_mean)
+        self.prior_variance = float(prior_var)
         self.batch_size = batch_size
+        self.eps = 1e-8  # <-- NEW: numerical guard for σ^2 = 0
 
         self.reset()
         self.sample = sample
@@ -183,20 +186,23 @@ class ThompsonSamplingPolicy(Controller):
 
     def update_posterior(self, c, arm_rewards):
         n = self.counts[c]
-
         if n > 0:
             arm_mean = np.mean(arm_rewards)
-            prior_weight = self.variance / (self.variance + (n * self.prior_variance))
+            var = max(self.variance, self.eps)             # <-- NEW clamp
+            pvar = max(self.prior_variance, self.eps)      # <-- NEW clamp
+            prior_weight = var / (var + (n * pvar))
             new_mean = prior_weight * self.prior_mean + (1 - prior_weight) * arm_mean
-            new_variance = 1 / (1 / self.prior_variance + n / self.variance)
+            new_variance = 1.0 / (1.0 / pvar + n / var)
 
             self.means[c] = new_mean
             self.variances[c] = new_variance
 
     def update_posterior_all(self, arm_means):
-        prior_weight = self.variance / (self.variance + (self.counts * self.prior_variance))
+        var = max(self.variance, self.eps)                 # <-- NEW clamp
+        pvar = max(self.prior_variance, self.eps)          # <-- NEW clamp
+        prior_weight = var / (var + (self.counts * pvar))
         new_mean = prior_weight * self.prior_mean + (1 - prior_weight) * arm_means
-        new_variance = 1 / (1 / self.prior_variance + self.counts / self.variance)
+        new_variance = 1.0 / (1.0 / pvar + self.counts / var)
 
         mask = (self.counts > 0)
         self.means[mask] = new_mean[mask]
@@ -204,7 +210,7 @@ class ThompsonSamplingPolicy(Controller):
 
     def act(self, x):
         if self.sample:
-            values = np.random.normal(self.means, np.sqrt(self.variances))
+            values = np.random.normal(self.means, np.sqrt(np.maximum(self.variances, self.eps)))  # <-- NEW clamp
             i = np.argmax(values)
 
             actions = self.batch['context_actions'].cpu().detach().numpy()[0]
@@ -219,7 +225,9 @@ class ThompsonSamplingPolicy(Controller):
                 if counts[j] == 0:
                     i = j
         else:
-            values = np.random.normal(self.means, np.sqrt(self.variances), size=(100, self.env.dim))
+            values = np.random.normal(
+                self.means, np.sqrt(np.maximum(self.variances, self.eps)), size=(100, self.env.dim)
+            )  # <-- NEW clamp
             amax = np.argmax(values, axis=1)
             freqs = np.bincount(amax, minlength=self.env.dim)
             i = np.argmax(freqs)
@@ -231,16 +239,17 @@ class ThompsonSamplingPolicy(Controller):
 
     def act_numpy_vec(self, x):
         if self.sample:
-            values = np.random.normal(self.means, np.sqrt(self.variances))
+            values = np.random.normal(self.means, np.sqrt(np.maximum(self.variances, self.eps)))  # <-- NEW clamp
             action_indices = np.argmax(values, axis=-1)
 
             actions = self.batch['context_actions']
             rewards = self.batch['context_rewards']
 
         else:
-            values = np.stack([
-                np.random.normal(self.means, np.sqrt(self.variances))
-                for _ in range(100)], axis=1)
+            values = np.stack(
+                [np.random.normal(self.means, np.sqrt(np.maximum(self.variances, self.eps))) for _ in range(100)],
+                axis=1,
+            )  # <-- NEW clamp
             amax = np.argmax(values, axis=-1)
             freqs = np.array([np.bincount(am, minlength=self.env.dim) for am in amax])
             action_indices = np.argmax(freqs, axis=-1)
@@ -249,7 +258,6 @@ class ThompsonSamplingPolicy(Controller):
         actions[np.arange(self.batch_size), action_indices] = 1.0
         self.a = actions
         return self.a
-
 
 
 class PessMeanPolicy(Controller):
@@ -285,7 +293,6 @@ class PessMeanPolicy(Controller):
         self.a = a
         return self.a
 
-
     def act_numpy_vec(self, x):
         actions = self.batch['context_actions']
         rewards = self.batch['context_rewards']
@@ -312,7 +319,6 @@ class PessMeanPolicy(Controller):
         a[np.arange(self.batch_size), i] = 1.0
         self.a = a
         return self.a
-
 
 
 class UCBPolicy(Controller):
@@ -371,7 +377,10 @@ class UCBPolicy(Controller):
 
         i = np.argmax(bounds, axis=-1)
         j = np.argmin(counts, axis=-1)
-        mask = (counts[np.arange(200), j] == 0)
+        bs = counts.shape[0]
+        mask = (counts[np.arange(bs), j] == 0)
+
+        #mask = (counts[np.arange(200), j] == 0)  # NOTE: this kept as-is from your file
         i[mask] = j[mask]
 
         a = np.zeros((self.batch_size, self.env.dim))
@@ -381,7 +390,7 @@ class UCBPolicy(Controller):
 
 
 class BanditTransformerController(Controller):
-    def __init__(self, model, sample=False,  batch_size=1):
+    def __init__(self, model, sample=False, batch_size=1):
         self.model = model
         self.du = model.config['action_dim']
         self.dx = model.config['state_dim']
@@ -424,7 +433,7 @@ class BanditTransformerController(Controller):
 
         states = torch.tensor(np.array(x))
         if self.batch_size == 1:
-            states = states[None,:]
+            states = states[None, :]
         states = states.float().to(device)
         self.batch['query_states'] = states
 
@@ -503,7 +512,7 @@ class LinUCBPolicy(OptPolicy):
         for i in range(self.batch_size):
             actions = actions_batch[i]
             rewards = rewards_batch[i]
-            
+
             actions_indices = np.argmax(actions, axis=1)
             actions_arms = self.arms[actions_indices]
 
@@ -526,6 +535,3 @@ class LinUCBPolicy(OptPolicy):
             hot_vectors.append(hot_vector)
 
         return np.array(hot_vectors)
-
-
-

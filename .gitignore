@@ -1,7 +1,16 @@
 datasets/
 figs/
+
+logs/
+figs_old/
 models/
+models_weak/
+models_weaklast/
+models_new/
+models_new_badeu_0/
+models_old/
 batches/
+wandb/
 backup/
 out/
 *.pt

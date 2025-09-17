@@ -1,0 +1,57 @@
+# sweeps/spice_bandit.yaml
+program: spice/train_spice.py
+method: bayes
+
+metric:
+  name: sanity/micro_regret_vs_dpt   # same objective
+  goal: minimize
+
+parameters:
+  env:        {value: bandit}
+  envs:       {value: 100000}
+  H:          {value: 500}
+  dim:        {value: 5}
+  var:        {value: 0.3}
+  cov:        {value: 0.0}
+  hists:      {value: 1}
+  samples:    {value: 1}
+  wandb:      {value: true}
+
+  # Model backbone
+  layer:      {values: [4, 6]}
+  head:       {values: [1, 4]}
+  embd:       {values: [64]}
+  dropout:    {values: [0.0, 0.1]}
+
+  # Optim
+  lr:         {values: [1e-4]}
+  num_epochs: {value: 300}
+  seed:       {values: [0, 1, 2]}
+  shuffle:    {values: [true, false]}
+
+  # SPICE hyper-params
+  spice_heads:   {values: [5, 7, 9, 11]}
+  spice_prior:   {values: [0.01, 0.05, 0.1]}
+  alphaA:        {values: [0.0, 0.5, 1.0]}
+  lambda_sigma:  {values: [0.0, 0.2, 0.5]}
+  c_sigma:       {values: [2.0, 3.0]}
+  lambda_q:      {values: [0.5, 1.0, 2.0]}
+  gamma:         {value: 0.99}
+
+  # IS stabilizers (NEW)
+  is_laplace:    {values: [0.5, 1.0]}   # α
+  is_cap:        {values: [10.0, 20.0]} # clamp on normalized IS weights
+
+  # Micro-probe cadence (NEW)
+  micro_probe_every: {value: 10}
+  micro_probe_H:     {value: 200}
+  micro_probe_n_eval:{value: 16}
+
+  # DPT baseline (must exist on disk)
+  dpt_ckpt:
+    value: /home/mila/a/anaisb/scratch/SPICE-toyenvs/models/bandit_shufTrue_lr0.0001_do0.0_embd64_layer6_head1_envs100000_hists1_samples1_var0.3_cov0.0_H500_d5_seed0_epoch300.pt
+
+early_terminate:
+  type: hyperband
+  min_iter: 60     # CHANGED: allow multiple micro-probe logs
+  eta: 3

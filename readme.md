@@ -1,63 +1,363 @@
-# Decision-Pretrained Transformer
 
-This repository contains an implemention of the Decision-Pretrained Transformer (DPT) from the paper [Supervised Pretraining Can Learn In-Context Reinforcement Learning](https://arxiv.org/abs/2306.14892).
-DPT is a transformer pretrained via supervised learning that can be deployed in new reinforcement learning (RL) tasks and solve them in-context. The method is intended to work and be studied in Meta-RL-like settings.
+# SPICE
 
-This repo supports pretraining and evaluating in the following settings:
-- Bandits
-- Dark Room (2D sparse-reward navigation)
-- A variant of [Miniworld](https://github.com/Farama-Foundation/Miniworld)
-
-### Abstract
-> Large transformer models trained on diverse datasets have shown a remarkable ability to learn in-context, achieving high few-shot performance on tasks they were not explicitly trained to solve. In this paper, we study the in-context learning capabilities of transformers in decision-making problems, i.e., reinforcement learning (RL) for bandits and Markov decision processes. To do so, we introduce and study Decision-Pretrained Transformer (DPT), a supervised pretraining method where the transformer predicts an optimal action given a query state and an in-context dataset of interactions, across a diverse set of tasks. This procedure, while simple, produces a model with several surprising capabilities. We find that the pretrained transformer can be used to solve a range of RL problems in-context, exhibiting both exploration online and conservatism offline, despite not being explicitly trained to do so. The model also generalizes beyond the pretraining distribution to new tasks and automatically adapts its decision-making strategies to unknown structure. Theoretically, we show DPT can be viewed as an efficient implementation of Bayesian posterior sampling, a provably sample-efficient RL algorithm. We further leverage this connection to provide guarantees on the regret of the in-context algorithm yielded by DPT, and prove that it can learn faster than algorithms used to generate the pretraining data. These results suggest a promising yet simple path towards instilling strong in-context decision-making abilities in transformers.
-
-## Instructions for Setting Up the Environment
+> **Environment setup (always required):**
+>
+> On any node or shell where you run commands:
+>
+> ```bash
+> module load anaconda/3
+> conda activate dpt
+> ```
 
 
-To create a new conda environment, open your terminal and run the following command:
+This repo implements bandit datasets, **DPT** baselines, and **SPICE** (a DPT‑style backbone with an ensemble value head and online adapters). The workflow is:
+
+1. **Collect data** (choose label type: optimal vs weak variants).
+2. **Train** DPT and SPICE on that dataset tag.
+3. **Evaluate** SPICE‑weak vs the corresponding DPT‑weak checkpoints (epoch‑matched).
+
+Paths in this README assume:
+
+```
+~/scratch/SPICE-toyenvs
+```
+
+---
+
+## Directory layout & outputs
+
+* **Datasets** → `datasets/*.pkl` (train/test/eval triplets; filenames encode H, d, var, cov, and your `--tag`).
+* **Models**
+
+  * DPT checkpoints → `models_weak/` or `models_weaklast/` (depending on `--models_dir`)
+  * SPICE checkpoints → same (`bandit_spice_epoch{EPOCH}_TIMESTAMP.pt`)
+* **Training logs** → `figs/loss/*.txt` and loss plots `figs/loss/*_train_loss.png`
+* **Eval figures** → `figs/fig2_bandit/*` (created by the eval modules)
+* **Job logs (Slurm)** → `logs/*.out` and `logs/*.err`
+
+---
+
+## 0) Key hyperparameters used across scripts
+
+* Bandit config: `H=500, dim=5, var=0.3`
+* **Data collection** uses `--fixed_omega 0.5` (see dataset types below)
+* **Train** scripts pass: `--H 500 --dim 5 --var 0.3 --cov 0.5`
+
+  * **Note:** `cov` in training filenames must match the **fixed\_omega** used during **data collection**, so the dataset filenames resolve correctly.
+
+---
+
+## 1) Data collection
+
+We generate three files per run: **train**, **test**, **eval**. Use `collect_data.py`.
+
+Common arguments (bandit):
+
+* `--env bandit --envs 100000 --envs_eval 200 --hists 1 --samples 1 --H 500 --dim 5 --var 0.3`
+* **Behavior bias**: `--bias random`
+* **Concentration (ω)**: `--fixed_omega 0.5` (mix 50% point mass on one arm + 50% Dirichlet draw)
+* **Label mode**: chooses the training label stored as `optimal_action` in each trajectory
+* **Tag**: appended to filenames; lets you keep multiple dataset variants side‑by‑side
+
+### Recommended weak datasets
+
+* **Weak (empirical argmax)** — “**weak**”
+
+  ```bash
+  cd ~/scratch/SPICE-toyenvs
+  python collect_data.py \
+    --env bandit --envs 100000 --envs_eval 200 \
+    --hists 1 --samples 1 --H 500 --dim 5 --var 0.3 \
+    --bias random --fixed_omega 0.5 \
+    --label_mode beh_argmax_emp --label_mix_q 0.0 \
+    --tag weak
+  ```
+
+  *Label = argmax over arms seen in the context weighted by observed rewards.*
+
+* **Weakest (last action)** — “**weaklast**”
+
+  ```bash
+  cd ~/scratch/SPICE-toyenvs
+  python collect_data.py \
+    --env bandit --envs 100000 --envs_eval 200 \
+    --hists 1 --samples 1 --H 500 --dim 5 --var 0.3 \
+    --bias random --fixed_omega 0.5 \
+    --label_mode beh_last \
+    --tag weaklast
+  ```
+
+  *Label = the **last** behavior action in the context. This is intentionally noisier.*
+
+### Other label modes (for reference)
+
+* `--label_mode optimal`
+  Uses the **true** optimal arm (not weak; best possible labels).
+* `--label_mode mix --label_mix_q q`
+  With probability `q`, use the **true** optimal arm; else use the behavior policy (or empirical argmax if probs missing).
+
+> After the run you should see:
+>
+> ```
+> datasets/trajs_bandit_envs100000_hists1_samples1_H500_d5_var0.3_cov0.5_train_<tag>.pkl
+> datasets/trajs_bandit_envs100000_hists1_samples1_H500_d5_var0.3_cov0.5_test_<tag>.pkl
+> datasets/trajs_bandit_envs100000_hists1_samples1_H500_d5_var0.3_cov0.5_eval_<tag>.pkl
+> ```
+
+### What does **fixed\_omega = 0.5** mean?
+
+Each context is generated by a **mixture** over arms:
+`probs = 0.5 * point_mass_on_one_arm + 0.5 * Dirichlet(alpha=1)`.
+So **half the probability mass** sits on a single chosen arm (random or optimal depending on `--bias`), and the other half is spread uniformly at random via Dirichlet. This governs **which actions appear** in the contexts from which labels are derived.
+
+---
+
+## 2) Training
+
+You’ll train **DPT** and **SPICE** **on the same dataset tag**.
+If you collected `--tag weaklast`, use `--dataset_tag weaklast` in both trainers.
+
+### DPT (weak or weaklast)
+
+Slurm script example (GPU):
+
+```
+sbatch sbatch/20_train_dpt_bandit_weaklast.sbatch
+```
+
+Contents (key line inside):
 
 ```bash
-conda create --name dpt python=3.9.15
+python train.py \
+  --env bandit --envs 100000 --hists 1 --samples 1 \
+  --H 500 --dim 5 --var 0.3 --cov 0.5 \
+  --embd 64 --layer 6 --head 1 --dropout 0.0 \
+  --lr 1e-4 --num_epochs 300 --shuffle True \
+  --seed ${SEED} --wandb False \
+  --dataset_tag weaklast \
+  --models_dir models_weaklast
 ```
 
-Install PyTorch by following the [official instructions here](https://pytorch.org/get-started/locally/) appropriately for your system. The recommended versions for the related packages are as follows with CUDA 11.7:
+Checkpoints will appear in `models_weaklast/` with names ending in `_epoch{50,100,...}.pt` and `_final_*.pt`. Training curves/logs go to `figs/loss/`.
+
+### SPICE (weak or weaklast)
+
+Slurm script example (GPU):
+
+```
+sbatch sbatch/30_train_spice_bandit_weaklast.sbatch
+```
+
+
 
 ```bash
-torch==1.13.0
-torchvision==0.14.0
+python -u spice/train_spice.py \
+  --env bandit --envs 100000 --hists 1 --samples 1 \
+  --H 500 --dim 5 --var 0.3 --cov 0.5 \
+  --embd 64 --layer 6 --head 1 --dropout 0.0 \
+  --lr 1e-4 --num_epochs 300 --shuffle True \
+  --seed ${SEED} --dataset_tag weaklast --models_dir models_weaklast \
+  --spice_heads 7 --spice_prior 0.1 \
+  --train_q_from_label True --q_ce_coef 0.5 --q_mse_coef 0.0 \
+  --anchor_coef 1e-6 \
+  --policy_iw --policy_adv --policy_epistemic \
+  --iw_clip 10 --adv_temp 0.15 --adv_clip 5.0 \
+  --epistemic_coef 1.0 --epistemic_clip 5.0
 ```
-For example, you might run:
+
+What this does:
+
+* **Policy loss**: cross‑entropy to the (weak) label, optionally **weighted** by:
+
+  * **Importance weights** (needs `context_action_probs` in the dataset; otherwise skipped),
+  * **Advantage weights** from Q,
+  * **Epistemic weights** from cross‑head std of Q.
+* **Q loss**: trains **head‑average Q** with **cross‑entropy to the label** (no privileged means).
+* **Anchor loss**: tiny L2 to keep heads near their own initial params (preserves diversity).
+* (Optional) **MSE to `means`** (privileged true per‑arm expectations). Disabled here (`--q_mse_coef 0.0`).
+
+Checkpoints will appear in `models_weaklast/` as `bandit_spice_epoch{E}_TIMESTAMP.pt`.
+
+---
+
+## 3) Evaluation: SPICE(weak) vs DPT(weak), epoch‑matched
+
+We provide a Slurm script that loops over all your **SPICE** checkpoints in a directory (e.g., `models_weak/` or `models_weaklast/`), infers the epoch number, and **pairs** each with a **DPT checkpoint of the same epoch** in the **same tag directory**. It then renders the full Fig‑2 style comparisons.
+
+> Make sure you’ve trained both DPT and SPICE in the **same** models dir (e.g., `models_weaklast`) with the same H/d/var/cov.
+
+### Submit the array job
 
 ```bash
-conda install pytorch=1.13.0 torchvision=0.14.0 cudatoolkit=11.7 -c pytorch -c nvidia
+cd ~/scratch/SPICE-toyenvs
+
+# Choose directory that contains BOTH DPT-weak and SPICE-weak checkpoints
+ls models_weaklast/ | wc -l
+
+# Count SPICE-weak checkpoints you want to evaluate
+N=$(ls -1 models_weaklast/bandit_spice_epoch*.pt 2>/dev/null | wc -l)
+echo "Found $N SPICE-weaklast checkpoints"
+
+# Limit concurrency with % to be nice to the cluster (e.g., 6 at a time)
+sbatch --array=0-$((N-1))%6 sbatch/55_eval_spiceweak_vs_dptweak.sbatch
 ```
 
-The remaining requirements are fairly standard and are listed in the `requirements.txt`. These can be installed by running
+That script:
+
+* Lists SPICE ckpts in `models_weaklast/` (or `models_weak/`).
+* Extracts `EPOCH` from filename.
+* Builds the matching **DPT** path with `_epoch${EPOCH}.pt` in the same directory.
+* Runs:
+
+  * the **full** comparison set,
+  * **posterior‑only** (SPICE posterior adaptation),
+  * and a **minimal** “posterior vs DPT” plot (skips other baselines).
+* Figures are written under `figs/fig2_bandit/` (check its stdout lines).
+
+> For a quick manual check on a single pair:
+>
+> ```bash
+> python -m spice.fig2_bandit_pair \
+>   --env bandit --H 500 --dim 5 --var 0.3 --n_eval 200 \
+>   --dpt_ckpt models_weaklast/<your-dpt-epochX>.pt \
+>   --spice_ckpt models_weaklast/<your-spice-epochX>.pt \
+>   --epoch_label E${X} \
+>   --spice_include posterior_ctx
+> ```
+
+---
+
+## Dataset types — what you control
+
+**Collection policy (context generator)**
+
+* `--bias random` → the point mass falls on a random arm.
+* `--bias optimal` → the point mass falls on the **true optimal** arm.
+
+**Concentration (ω)**
+
+* `--fixed_omega ω` with `ω ∈ [0,1]`.
+  Context action probabilities are:
+
+  ```
+  probs = (1 - ω) * Dirichlet(1)  +  ω * one_hot(point_arm)
+  ```
+
+  With `ω=0.5` we put **half** the mass on the chosen arm and **half** spread uniformly by Dirichlet.
+
+**Label type**
+
+* `--label_mode optimal` → true best arm (strong labels).
+* `--label_mode beh_last` → **last behavior action** in the context (weakest).
+* `--label_mode beh_argmax_emp` → empirical best arm from the context (weak).
+* `--label_mode mix --label_mix_q q` → with prob. `q` use **optimal**, else behavior‑based.
+
+**Tag**
+
+* `--tag weak`, `--tag weaklast`, …
+  Adds a suffix to dataset filenames. Training scripts must pass the **matching** `--dataset_tag`.
+
+---
+
+## How SPICE works (training & deployment)
+
+**Model = Transformer trunk + two heads**
+
+* **Policy head**: produces **action logits** (`[B,H,A]` in train; `[B,A]` at eval).
+  Trained with **cross‑entropy to the dataset label** (your weak/optimal label).
+* **Value ensemble (K heads)**: for each action, produce **K Q‑values** (`Q ∈ ℝ^{K×A}`), implemented with small MLP heads, each with a **frozen random prior** term added (keeps heads diverse in low‑data regions).
+
+Training in this repo 
+
+* **Policy loss**: cross‑entropy to label. Optional multiplicative weights:
+
+  * **Importance weighting (IW):** uses stored `context_action_probs` to debias against behavior (uniform vs behavior log‑ratio); clipped.
+  * **Advantage weighting:** `exp((Q_label - V)/τ)` using head‑mean Q; emphasizes high‑advantage samples.
+  * **Epistemic weighting:** `(1 + λ·std_K(Q_label))`; emphasizes uncertain actions.
+* **Q loss (no privileged means)**: CE to the label on **head‑mean Q** treated as logits.
+  This makes the ensemble put **higher Q** on the labelled action class while keeping head‑wise diversity via the randomised priors.
+* **Anchor loss**: tiny L2 to keep each head near its own initialization (avoids collapse).
+
+> *Why not use true `means`?* On **weak** datasets we avoid privileged targets; Q heads learn to separate actions in a label‑consistent way, and then we adapt them **at evaluation time** with the observed context.
+
+**Online SPICE controller variants (used in eval)**
+
+* `policy_logits`
+  Just use the policy head (like DPT). No Q ensemble.
+
+* `qmean_ctx`
+  Average Q across heads and act greedily. Minimal use of ensemble, no adaptation.
+
+* `posterior_ctx`  **(strongest)**
+  Treat each head’s per‑action output as a feature; fit a small **posterior** (Bayesian/ridge‑like) using the **observed context rewards**; use posterior **mean** (or sample) to score actions at the query.
+  Intuition: the ensemble provides a basis of hypotheses; the context “rotates/scales” them into a posterior.
+
+* `ucb_ctx`
+  Like `posterior_ctx`, but pick actions by **optimistic** score = posterior mean + β × posterior std.
+
+* `adapter_ctx`
+  Lightweight **ridge**/linear adapter trained on the context to predict rewards from head outputs; use adapted predictor at the query.
+
+* `ts_noctx`
+  Thompson sampling **without** adaptation: pick a head at episode start and act greedily w\.r.t. that head for temporal coherence (works better online than offline evaluation).
+
+> In our evaluation scripts, you can select which SPICE variants to include with
+> `--spice_include posterior_ctx` (or a comma‑separated list if supported).
+> The “posterior‑only” evaluation batch runs exactly that one.
+
+---
+
+## Sanity checks & tips
+
+* **Datasets present**:
+
+  ```bash
+  ls datasets/*weaklast*.pkl
+  ```
+* **Match tags** between data and training:
+  `--tag weaklast` in data → `--dataset_tag weaklast` in both DPT & SPICE trainers.
+* **Match cov / omega**: training uses `--cov 0.5` so filenames align to `fixed_omega 0.5`.
+* **GPU jobs**: If Slurm complains about limits (`AssocMaxSubmitJobLimit`, `JobArrayTaskLimit`), lower the `%` concurrency in `--array`.
+* **PS1 error in Slurm**: add `export PS1="${PS1-}"` at top of scripts (already done in our templates).
+* **IW needs behavior probs**: for IW, the dataset must contain `context_action_probs`; this is present when contexts are generated by our Dirichlet+point‑mass mixer. If missing, IW is skipped.
+
+---
+
+## Example end‑to‑end (weaklast)
+
+1. **Collect data**:
 
 ```bash
-pip install -r requirements.txt
+cd ~/scratch/SPICE-toyenvs
+python collect_data.py \
+  --env bandit --envs 100000 --envs_eval 200 \
+  --hists 1 --samples 1 --H 500 --dim 5 --var 0.3 \
+  --bias random --fixed_omega 0.5 \
+  --label_mode beh_last \
+  --tag weaklast
 ```
 
-If you want to run optional Miniworld experiments, follow these steps to install the Miniworld environment:
+2. **Train DPT** (GPU):
 
 ```bash
-git clone https://github.com/jon--lee/Miniworld.git
-cd Miniworld
-git checkout modified
-pip install -e .
+sbatch sbatch/20_train_dpt_bandit_weaklast.sbatch
 ```
 
-## Running Experiments
+3. **Train SPICE** (GPU):
 
-Each experiment has three phases: (1) pretraining data collection (2) pretraining (3) evaluation of the in-context algorithm. See the paper for details. There are files `run_bandit.sh`, `run_darkroom.sh`, and `run_miniworld.sh` that show example usage to run these. Training in all settings can take several hours, so it may be prudent to start with smaller problems (e.g. fewer arms, reduced time horizon, etc.). The aboves scripts for bandits and darkroom will generate about 4gb of data total. Miniworld will be substantially larger, so please ensure that you have sufficient disk space.
-
-It is recommended to run batches of data collection in parallel for Miniworld because it requires generating images, which is slower. 
-
+```bash
+sbatch sbatch/30_train_spice_bandit_weaklast.sbatch
 ```
-@article{lee2023supervised,
-  title={Supervised Pretraining Can Learn In-Context Reinforcement Learning},
-  author={Lee, Jonathan N and Xie, Annie and Pacchiano, Aldo and Chandak, Yash and Finn, Chelsea and Nachum, Ofir and Brunskill, Emma},
-  journal={arXiv preprint arXiv:2306.14892},
-  year={2023}
-}
+
+4. **Evaluate SPICE vs DPT** (epoch‑matched pairs):
+
+```bash
+cd ~/scratch/SPICE-toyenvs
+N=$(ls -1 models_weaklast/bandit_spice_epoch*.pt 2>/dev/null | wc -l)
+echo "Found $N SPICE-weaklast checkpoints"
+sbatch --array=0-$((N-1))%6 sbatch/55_eval_spiceweak_vs_dptweak.sbatch
 ```
+
+Figures will appear under `figs/fig2_bandit/` (look for your `epoch_label` suffixes).
+
